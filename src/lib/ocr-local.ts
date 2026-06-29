@@ -247,8 +247,9 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
   for (const [key, meta] of Object.entries(KEY_MAP)) {
     // 키 패턴: 지정된 alt 또는 키의 특수문자를 이스케이프
     const keyPat = meta.alt ?? key.replace(/[/\-.]/g, (c) => `\\${c}`);
-    // 구분자: = : - – — 를 OCR 오인식 허용
-    const re = new RegExp(`${keyPat}\\s*[=:\\-–—]\\s*([\\d.]+)`, 'i');
+    // 라인 시작에서 키를 찾고, 구분자(= : - 공백 등)를 0~4자 허용
+    // → LDL=129, LDL-129, LDL 129, LDL: 129 모두 매칭
+    const re = new RegExp(`^\\s*${keyPat}[^a-zA-Z\\d\\n]{0,4}(\\d[\\d.]*)`, 'im');
     const m = text.match(re);
     if (!m) continue;
     const value = parseFloat(m[1]);
