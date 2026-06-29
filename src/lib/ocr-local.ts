@@ -212,37 +212,60 @@ async function parseClinic(imageDataUrl: string): Promise<OcrResult> {
 async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
   const { text } = await recognize(imageDataUrl);
 
-  const KEY_MAP: Record<string, { name: string; nameEn: string; unit: string }> = {
-    TC:       { name: '총콜레스테롤',    nameEn: 'Total Cholesterol',        unit: 'mg/dL' },
-    HDL:      { name: 'HDL 콜레스테롤', nameEn: 'HDL Cholesterol',          unit: 'mg/dL' },
-    TRG:      { name: '중성지방',        nameEn: 'Triglycerides',            unit: 'mg/dL' },
-    LDL:      { name: 'LDL 콜레스테롤', nameEn: 'LDL Cholesterol (calc)',   unit: 'mg/dL' },
-    'non-HDL':{ name: 'non-HDL 콜레스테롤', nameEn: 'non-HDL Cholesterol', unit: 'mg/dL' },
-    'TC/HDL': { name: 'TC/HDL 비율',    nameEn: 'TC/HDL Ratio',            unit: ''      },
-    GLU:      { name: '공복혈당',        nameEn: 'Fasting Glucose',          unit: 'mg/dL' },
+  const KEY_MAP: Record<string, {
+    name: string; nameEn: string; unit: string;
+    refMin?: number; refMax?: number;
+    // alt: Tesseract가 키를 다르게 읽을 때 대체 패턴
+    alt?: string;
+  }> = {
+    TC:       { name: '총콜레스테롤',        nameEn: 'Total Cholesterol',      unit: 'mg/dL', refMin: 0,  refMax: 199 },
+    HDL:      { name: 'HDL 콜레스테롤',      nameEn: 'HDL Cholesterol',        unit: 'mg/dL', refMin: 40, refMax: 999 },
+    TRG:      { name: '중성지방',            nameEn: 'Triglycerides',          unit: 'mg/dL', refMin: 0,  refMax: 149 },
+    LDL:      { name: 'LDL 콜레스테롤',      nameEn: 'LDL Cholesterol (calc)', unit: 'mg/dL', refMin: 0,  refMax: 129 },
+    'non-HDL':{ name: 'non-HDL 콜레스테롤',  nameEn: 'non-HDL Cholesterol',   unit: 'mg/dL', refMin: 0,  refMax: 159, alt: 'non.{0,2}HDL' },
+    'TC/HDL': { name: 'TC/HDL 비율',         nameEn: 'TC/HDL Ratio',           unit: '',      refMin: 0,  refMax: 4.9, alt: 'TC.{0,2}HDL' },
+    GLU:      { name: '공복혈당',            nameEn: 'Fasting Glucose',        unit: 'mg/dL', refMin: 70, refMax: 100 },
   };
 
-  const dateMatch = text.match(/(\d{4})[^\d](\d{2})[^\d](\d{2})/);
-  const examDate = dateMatch
-    ? `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`
-    : null;
+  // 날짜: "YYYY-MM-DD" 또는 "DD Mon YYYY" (Cholestech 출력 형식)
+  const MONTHS: Record<string, string> = {
+    jan:'01', feb:'02', mar:'03', apr:'04', may:'05', jun:'06',
+    jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12',
+  };
+  let examDate: string | null = null;
+  const d1 = text.match(/(\d{4})[^\d](\d{2})[^\d](\d{2})/);
+  if (d1) {
+    examDate = `${d1[1]}-${d1[2]}-${d1[3]}`;
+  } else {
+    const d2 = text.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})/i);
+    if (d2) {
+      examDate = `${d2[3]}-${MONTHS[d2[2].toLowerCase()]}-${d2[1].padStart(2, '0')}`;
+    }
+  }
 
   const items: OcrResult['items'] = [];
   for (const [key, meta] of Object.entries(KEY_MAP)) {
-    const re = new RegExp(`${key}\\s*[=:]\\s*([\\d.]+)`, 'i');
+    // 키 패턴: 지정된 alt 또는 키의 특수문자를 이스케이프
+    const keyPat = meta.alt ?? key.replace(/[/\-.]/g, (c) => `\\${c}`);
+    // 구분자: = : - – — 를 OCR 오인식 허용
+    const re = new RegExp(`${keyPat}\\s*[=:\\-–—]\\s*([\\d.]+)`, 'i');
     const m = text.match(re);
     if (!m) continue;
     const value = parseFloat(m[1]);
+    const { refMin, refMax } = meta;
+    const itemStatus = (refMin !== undefined && refMax !== undefined)
+      ? (value >= refMin && value <= refMax ? 'normal' as const : 'caution' as const)
+      : 'unknown' as const;
     items.push({
       name: meta.name,
       name_en: meta.nameEn,
       value,
       display_value: null,
       unit: meta.unit,
-      ref_min: null,
-      ref_max: null,
-      status: 'unknown',
-      confidence: 0.7,
+      ref_min: refMin ?? null,
+      ref_max: refMax !== undefined && refMax >= 900 ? null : (refMax ?? null),
+      status: itemStatus,
+      confidence: 0.75,
     });
   }
 
