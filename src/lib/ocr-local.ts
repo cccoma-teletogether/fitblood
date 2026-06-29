@@ -338,70 +338,101 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
     if (!found.has(key)) console.debug(`[OCR-B miss after stage2] ${key}`);
   }
 
-  // ── 3단계: 순수 위치 기반 추출 (키 레이블 인식 완전 실패 대비) ──
-  // Cholestech는 TC,HDL,TRG,LDL,non-HDL,TC/HDL,GLU 순서가 고정됨
-  // → "Name/ID" 구분선 이하, 왼쪽 60% 영역의 숫자를 Y 순서대로 7개 키에 매핑
+  // ── 3단계: 행 기반 위치 추출 (키 레이블 인식 완전 실패 대비) ──
+  // Cholestech는 TC,HDL,TRG,LDL,non-HDL,TC/HDL,GLU 순서 고정.
+  // 행 전체 텍스트에서 값을 추출해 Y 순으로 KEY_ORDER에 매핑.
   if (found.size < KEY_ORDER.length) {
-    // 구분선 Y 위치 추정: "Name", "ID", "------" 키워드 또는 기인식 항목 최소 Y
     let valAreaTopY = 0;
     for (const w of words) {
       const t = w.text.trim().toLowerCase();
-      // "Name/" 또는 "Name" 등 다양한 형태 허용
-      if (t.startsWith('name') || t === 'id' || t === 'sample' || /^[-─_]{3,}$/.test(t)) {
+      if (t.startsWith('name') || t === 'id' || t.startsWith('sample') || /^[-─_]{3,}$/.test(t)) {
         valAreaTopY = Math.max(valAreaTopY, w.bbox.y1);
       }
     }
-    // 기인식 항목이 있으면 그 중 최소 Y를 기준으로 보정
     for (const row of rows) {
       const rowText = row.map(w => w.text).join(' ');
       for (const key of MATCH_ORDER) {
         if (!found.has(key)) continue;
         if (META[key].patterns.some(p => p.test(rowText))) {
           const rowTop = Math.min(...row.map(w => w.bbox.y0));
-          if (rowTop > valAreaTopY) valAreaTopY = rowTop - 2; // 첫 값 행 직전
+          if (rowTop > valAreaTopY) valAreaTopY = rowTop - 2;
         }
       }
     }
-    // 아직도 0이면 전체 Y 범위의 상위 25% 컷
     if (valAreaTopY === 0) {
       const ys = words.map(w => w.bbox.y0);
       valAreaTopY = Math.min(...ys) + (Math.max(...ys) - Math.min(...ys)) * 0.25;
     }
 
-    const maxX = Math.max(...words.map(w => w.bbox.x1), 1);
-
-    // 값 영역 숫자 수집 (오른쪽 mg/dL 컬럼 제외, 연도 제외)
-    // "TC=143" 형태도 처리: =뒤 숫자를 가상 단어로 추가
-    const expandedWords: (TWord & { numVal: number })[] = [];
-    for (const w of words) {
-      if (w.bbox.y0 < valAreaTopY || w.bbox.x1 >= maxX * 0.65) continue;
-      const t = w.text.trim();
-      // 순수 숫자
-      if (/^\d[\d.]*$/.test(t)) {
-        const v = parseFloat(t);
-        if (v > 0 && !(v >= 2020 && v <= 2030)) expandedWords.push({ ...w, numVal: v });
-        continue;
-      }
-      // KEY=VALUE 또는 KEY=VALUE 패턴에서 숫자 추출
-      const eqMatch = t.match(/=(\d+(?:\.\d+)?)$/);
+    // 행 텍스트에서 숫자값 추출 (KEY=VALUE, split숫자, 소수 모두 처리)
+    function extractRowValue(rowText: string): number | null {
+      // 소수 (TC/HDL 비율)
+      const decMatch = rowText.match(/\b(\d{1,3}\.\d+)\b/);
+      if (decMatch) return parseFloat(decMatch[1]);
+      // KEY=VALUE: TC=230: HDL=38) 등 뒤에 비숫자 허용
+      const eqMatch = rowText.match(/=(\d+)/);
       if (eqMatch) {
         const v = parseFloat(eqMatch[1]);
-        if (v > 0 && !(v >= 2020 && v <= 2030)) expandedWords.push({ ...w, numVal: v });
+        if (v > 0 && !(v >= 2020 && v <= 2030)) return v;
       }
+      // 연도 제외 숫자 수집
+      const nums = (rowText.match(/\d+/g) ?? []).filter(n => {
+        const v = parseInt(n);
+        return v > 0 && !(v >= 2020 && v <= 2030);
+      });
+      if (!nums.length) return null;
+      // 2-3자리 직접 우선
+      const good = nums.find(n => n.length >= 2 && n.length <= 3 && parseInt(n) >= 20);
+      if (good) return parseFloat(good);
+      // split 숫자 결합: "21 3%" → "213"
+      const concat = nums.slice(0, 3).join('');
+      if (concat.length >= 2 && concat.length <= 4) {
+        const v = parseFloat(concat);
+        if (v >= 20 && v < 2000) return v;
+      }
+      return null;
     }
-    const candidateNums = expandedWords.sort((a, b) => a.bbox.y0 - b.bbox.y0);
 
-    console.debug('[OCR-B pos-candidates]', candidateNums.map(w => `${w.text}@y${w.bbox.y0}`));
+    // 구분선 아래 값을 가진 행들을 Y 순으로 수집
+    const dataRows = rows
+      .filter(row => {
+        const rowTop = Math.min(...row.map(w => w.bbox.y0));
+        if (rowTop < valAreaTopY) return false;
+        const rt = row.map(w => w.text).join(' ').trim();
+        return !/^(mg\/?dL[\s]*)+$/i.test(rt);
+      })
+      .map(row => ({
+        y: Math.min(...row.map(w => w.bbox.y0)),
+        text: row.map(w => w.text).join(' '),
+        value: extractRowValue(row.map(w => w.text).join(' ')),
+      }))
+      .filter(r => r.value !== null)
+      .sort((a, b) => a.y - b.y);
 
-    // KEY_ORDER 인덱스(0~6)로 Y-정렬된 숫자에 직접 매핑
-    KEY_ORDER.forEach((key, idx) => {
-      if (found.has(key)) return;
-      const cand = candidateNums[idx];
-      if (cand) {
-        found.set(key, cand.numVal);
-        console.debug(`[OCR-B pos] ${key}[${idx}] = ${cand.numVal} (from "${cand.text}")`);
+    console.debug('[OCR-B pos-candidates]', dataRows.map(r => `${r.value}@y${r.y} "${r.text}"`));
+
+    // KEY_ORDER 순으로 dataRows를 소비: 이미 찾은 키는 row 하나씩 건너뜀
+    let rowIdx = 0;
+    for (let ki = 0; ki < KEY_ORDER.length; ki++) {
+      const key = KEY_ORDER[ki];
+      if (found.has(key)) { rowIdx++; continue; }
+      if (rowIdx < dataRows.length) {
+        found.set(key, dataRows[rowIdx]!.value!);
+        console.debug(`[OCR-B pos] ${key}[${ki}] = ${dataRows[rowIdx]!.value}`);
       }
-    });
+      rowIdx++;
+    }
+  }
+
+  // ── 4단계: TC/HDL·non-HDL 수식 유도 (OCR 실패 최후 보완) ──
+  if (!found.has('non-HDL') && found.has('TC') && found.has('HDL')) {
+    found.set('non-HDL', found.get('TC')! - found.get('HDL')!);
+    console.debug('[OCR-B derived] non-HDL =', found.get('non-HDL'));
+  }
+  if (!found.has('TC/HDL') && found.has('TC') && found.has('HDL') && found.get('HDL')! > 0) {
+    const ratio = Math.round(found.get('TC')! / found.get('HDL')! * 10) / 10;
+    found.set('TC/HDL', ratio);
+    console.debug('[OCR-B derived] TC/HDL =', ratio);
   }
 
   console.debug('[OCR-B result]', Object.fromEntries(found));
