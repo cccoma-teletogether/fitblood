@@ -11,6 +11,24 @@ type TWord = {
   confidence: number;
 };
 
+/* ─── 이미지 전처리: 2배 확대 + 고대비 흑백 ─── */
+async function preprocessForOcr(dataUrl: string): Promise<string> {
+  if (typeof document === 'undefined') return dataUrl;
+  return new Promise((resolve) => {
+    const img = new window.Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width * 2;
+      canvas.height = img.height * 2;
+      const ctx = canvas.getContext('2d')!;
+      ctx.filter = 'grayscale(100%) contrast(220%) brightness(110%)';
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/png'));
+    };
+    img.src = dataUrl;
+  });
+}
+
 /* ─── Tesseract 실행 ─── */
 async function recognize(imageDataUrl: string): Promise<{ words: TWord[]; text: string }> {
   const { createWorker } = await import('tesseract.js');
@@ -208,26 +226,27 @@ async function parseClinic(imageDataUrl: string): Promise<OcrResult> {
 
 /* ─────────────────────────────────────────
    유형 B: 보건소 Cholestech LDX (KEY=VALUE)
+   전략: 이미지 전처리 → bounding-box 행별 매칭 → text regex 보완
 ───────────────────────────────────────── */
 async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
-  const { text } = await recognize(imageDataUrl);
+  // 전처리: 2배 확대 + 고대비 흑백 → Tesseract 정확도 대폭 향상
+  const processed = await preprocessForOcr(imageDataUrl);
+  const { words, text } = await recognize(processed);
 
-  const KEY_MAP: Record<string, {
-    name: string; nameEn: string; unit: string;
-    refMin?: number; refMax?: number;
-    // alt: Tesseract가 키를 다르게 읽을 때 대체 패턴
-    alt?: string;
-  }> = {
-    TC:       { name: '총콜레스테롤',        nameEn: 'Total Cholesterol',      unit: 'mg/dL', refMin: 0,  refMax: 199 },
-    HDL:      { name: 'HDL 콜레스테롤',      nameEn: 'HDL Cholesterol',        unit: 'mg/dL', refMin: 40, refMax: 999 },
-    TRG:      { name: '중성지방',            nameEn: 'Triglycerides',          unit: 'mg/dL', refMin: 0,  refMax: 149 },
-    LDL:      { name: 'LDL 콜레스테롤',      nameEn: 'LDL Cholesterol (calc)', unit: 'mg/dL', refMin: 0,  refMax: 129 },
-    'non-HDL':{ name: 'non-HDL 콜레스테롤',  nameEn: 'non-HDL Cholesterol',   unit: 'mg/dL', refMin: 0,  refMax: 159, alt: 'non.{0,2}HDL' },
-    'TC/HDL': { name: 'TC/HDL 비율',         nameEn: 'TC/HDL Ratio',           unit: '',      refMin: 0,  refMax: 4.9, alt: 'TC.{0,2}HDL' },
-    GLU:      { name: '공복혈당',            nameEn: 'Fasting Glucose',        unit: 'mg/dL', refMin: 70, refMax: 100 },
-  };
+  console.debug('[OCR-B raw]', text);
 
-  // 날짜: "YYYY-MM-DD" 또는 "DD Mon YYYY" (Cholestech 출력 형식)
+  // 항목 정의: TC/HDL·non-HDL을 TC·HDL보다 먼저 체크 (부분문자열 충돌 방지)
+  const ITEMS = [
+    { key: 'TC/HDL',  re: /TC.?HDL/i,       name: 'TC/HDL 비율',         nameEn: 'TC/HDL Ratio',           unit: '',      refMin: 0,  refMax: 4.9  },
+    { key: 'non-HDL', re: /non.{0,2}HDL/i,  name: 'non-HDL 콜레스테롤',  nameEn: 'non-HDL Cholesterol',   unit: 'mg/dL', refMin: 0,  refMax: 159  },
+    { key: 'TC',      re: /\bTC\b/i,         name: '총콜레스테롤',         nameEn: 'Total Cholesterol',      unit: 'mg/dL', refMin: 0,  refMax: 199  },
+    { key: 'HDL',     re: /\bHDL\b/i,        name: 'HDL 콜레스테롤',       nameEn: 'HDL Cholesterol',        unit: 'mg/dL', refMin: 40, refMax: 999  },
+    { key: 'TRG',     re: /\bTRG\b/i,        name: '중성지방',             nameEn: 'Triglycerides',          unit: 'mg/dL', refMin: 0,  refMax: 149  },
+    { key: 'LDL',     re: /\bLDL\b/i,        name: 'LDL 콜레스테롤',       nameEn: 'LDL Cholesterol (calc)', unit: 'mg/dL', refMin: 0,  refMax: 129  },
+    { key: 'GLU',     re: /\bGLU\b/i,        name: '공복혈당',             nameEn: 'Fasting Glucose',        unit: 'mg/dL', refMin: 70, refMax: 100  },
+  ];
+
+  // 날짜 파싱: "DD Mon YYYY" 또는 "YYYY-MM-DD"
   const MONTHS: Record<string, string> = {
     jan:'01', feb:'02', mar:'03', apr:'04', may:'05', jun:'06',
     jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12',
@@ -243,36 +262,53 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
     }
   }
 
-  // OCR 디버그: 개발자 도구 콘솔에서 원본 텍스트 확인 가능
-  console.debug('[OCR-B raw]', text);
+  const found = new Map<string, number>();
 
-  const items: OcrResult['items'] = [];
-  for (const [key, meta] of Object.entries(KEY_MAP)) {
-    // 키 패턴: 지정된 alt 또는 키의 특수문자를 이스케이프
-    const keyPat = meta.alt ?? key.replace(/[/\-.]/g, (c) => `\\${c}`);
+  // ── 1단계: bounding-box 행별 매칭 ──
+  // 각 행에서 키 레이블과 숫자를 함께 찾음 → =부호 오인식에 완전히 독립적
+  const rows = groupRows(words, 18);
+  for (const row of rows) {
+    const rowText = row.map((w) => w.text).join(' ');
+    const nums = rowText.match(/\d[\d.]*/g);
+    if (!nums) continue;
 
-    // 1단계: 라인 시작 매칭 (가장 정확)
+    for (const item of ITEMS) {
+      if (found.has(item.key)) continue;
+      if (!item.re.test(rowText)) continue;
+      const value = parseFloat(nums[0]);
+      if (!isNaN(value)) found.set(item.key, value);
+      break; // 이 행은 이 항목이 처리 — 다음 행으로
+    }
+  }
+
+  // ── 2단계: text regex 보완 (행 그룹화로 못 잡은 항목) ──
+  for (const item of ITEMS) {
+    if (found.has(item.key)) continue;
+    const keyPat = item.key.replace(/[/\-.]/g, (c) => `\\${c}`);
     const re1 = new RegExp(`^\\s*${keyPat}[^a-zA-Z\\d\\n\\r]{0,4}(\\d[\\d.]*)`, 'im');
-    // 2단계: Tesseract가 줄을 합친 경우 — 앞에 알파벳이 없으면 매칭
     const re2 = new RegExp(`(?:^|[^a-zA-Z])${keyPat}[^a-zA-Z\\d]{0,4}(\\d[\\d.]*)`, 'i');
-
     const m = text.match(re1) ?? text.match(re2);
-    if (!m) { console.debug(`[OCR-B miss] ${key}`); continue; }
-    const value = parseFloat(m[1]);
-    const { refMin, refMax } = meta;
-    const itemStatus = (refMin !== undefined && refMax !== undefined)
-      ? (value >= refMin && value <= refMax ? 'normal' as const : 'caution' as const)
-      : 'unknown' as const;
+    if (m) found.set(item.key, parseFloat(m[1]));
+    else console.debug(`[OCR-B miss] ${item.key}`);
+  }
+
+  // ── 결과 조립 ──
+  const items: OcrResult['items'] = [];
+  for (const item of ITEMS) {
+    const value = found.get(item.key);
+    if (value === undefined) continue;
+    const { refMin, refMax } = item;
+    const itemStatus = (value >= refMin && value <= refMax) ? 'normal' as const : 'caution' as const;
     items.push({
-      name: meta.name,
-      name_en: meta.nameEn,
+      name: item.name,
+      name_en: item.nameEn,
       value,
       display_value: null,
-      unit: meta.unit,
-      ref_min: refMin ?? null,
-      ref_max: refMax !== undefined && refMax >= 900 ? null : (refMax ?? null),
+      unit: item.unit,
+      ref_min: refMin,
+      ref_max: refMax >= 900 ? null : refMax,
       status: itemStatus,
-      confidence: 0.75,
+      confidence: 0.82,
     });
   }
 
