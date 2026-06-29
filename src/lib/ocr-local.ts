@@ -243,15 +243,21 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
     }
   }
 
+  // OCR 디버그: 개발자 도구 콘솔에서 원본 텍스트 확인 가능
+  console.debug('[OCR-B raw]', text);
+
   const items: OcrResult['items'] = [];
   for (const [key, meta] of Object.entries(KEY_MAP)) {
     // 키 패턴: 지정된 alt 또는 키의 특수문자를 이스케이프
     const keyPat = meta.alt ?? key.replace(/[/\-.]/g, (c) => `\\${c}`);
-    // 라인 시작에서 키를 찾고, 구분자(= : - 공백 등)를 0~4자 허용
-    // → LDL=129, LDL-129, LDL 129, LDL: 129 모두 매칭
-    const re = new RegExp(`^\\s*${keyPat}[^a-zA-Z\\d\\n]{0,4}(\\d[\\d.]*)`, 'im');
-    const m = text.match(re);
-    if (!m) continue;
+
+    // 1단계: 라인 시작 매칭 (가장 정확)
+    const re1 = new RegExp(`^\\s*${keyPat}[^a-zA-Z\\d\\n\\r]{0,4}(\\d[\\d.]*)`, 'im');
+    // 2단계: Tesseract가 줄을 합친 경우 — 앞에 알파벳이 없으면 매칭
+    const re2 = new RegExp(`(?:^|[^a-zA-Z])${keyPat}[^a-zA-Z\\d]{0,4}(\\d[\\d.]*)`, 'i');
+
+    const m = text.match(re1) ?? text.match(re2);
+    if (!m) { console.debug(`[OCR-B miss] ${key}`); continue; }
     const value = parseFloat(m[1]);
     const { refMin, refMax } = meta;
     const itemStatus = (refMin !== undefined && refMax !== undefined)
