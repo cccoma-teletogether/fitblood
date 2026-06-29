@@ -226,25 +226,39 @@ async function parseClinic(imageDataUrl: string): Promise<OcrResult> {
 
 /* ─────────────────────────────────────────
    유형 B: 보건소 Cholestech LDX (KEY=VALUE)
-   전략: 이미지 전처리 → bounding-box 행별 매칭 → text regex 보완
+   3단계 전략:
+   1) 행별 퍼지 매칭 (=부호 독립)
+   2) 전체 텍스트 regex 보완
+   3) 순수 위치 기반 (키 레이블 인식 실패 대비)
 ───────────────────────────────────────── */
 async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
-  // 전처리: 2배 확대 + 고대비 흑백 → Tesseract 정확도 대폭 향상
   const processed = await preprocessForOcr(imageDataUrl);
   const { words, text } = await recognize(processed);
 
   console.debug('[OCR-B raw]', text);
 
-  // 항목 정의: TC/HDL·non-HDL을 TC·HDL보다 먼저 체크 (부분문자열 충돌 방지)
-  const ITEMS = [
-    { key: 'TC/HDL',  re: /TC.?HDL/i,       name: 'TC/HDL 비율',         nameEn: 'TC/HDL Ratio',           unit: '',      refMin: 0,  refMax: 4.9  },
-    { key: 'non-HDL', re: /non.{0,2}HDL/i,  name: 'non-HDL 콜레스테롤',  nameEn: 'non-HDL Cholesterol',   unit: 'mg/dL', refMin: 0,  refMax: 159  },
-    { key: 'TC',      re: /\bTC\b/i,         name: '총콜레스테롤',         nameEn: 'Total Cholesterol',      unit: 'mg/dL', refMin: 0,  refMax: 199  },
-    { key: 'HDL',     re: /\bHDL\b/i,        name: 'HDL 콜레스테롤',       nameEn: 'HDL Cholesterol',        unit: 'mg/dL', refMin: 40, refMax: 999  },
-    { key: 'TRG',     re: /\bTRG\b/i,        name: '중성지방',             nameEn: 'Triglycerides',          unit: 'mg/dL', refMin: 0,  refMax: 149  },
-    { key: 'LDL',     re: /\bLDL\b/i,        name: 'LDL 콜레스테롤',       nameEn: 'LDL Cholesterol (calc)', unit: 'mg/dL', refMin: 0,  refMax: 129  },
-    { key: 'GLU',     re: /\bGLU\b/i,        name: '공복혈당',             nameEn: 'Fasting Glucose',        unit: 'mg/dL', refMin: 70, refMax: 100  },
-  ];
+  // Cholestech는 항상 이 순서로 7개 항목 출력
+  const KEY_ORDER = ['TC', 'HDL', 'TRG', 'LDL', 'non-HDL', 'TC/HDL', 'GLU'] as const;
+  type ItemKey = typeof KEY_ORDER[number];
+
+  const META: Record<ItemKey, {
+    name: string; nameEn: string; unit: string; refMin: number; refMax: number;
+    // 퍼지 패턴 — OCR 오인식 허용 (LDL→LBI, LDI 등)
+    patterns: RegExp[];
+  }> = {
+    'TC':     { name: '총콜레스테롤',         nameEn: 'Total Cholesterol',      unit: 'mg/dL', refMin: 0,  refMax: 199, patterns: [/\bTC\b/i] },
+    'HDL':    { name: 'HDL 콜레스테롤',       nameEn: 'HDL Cholesterol',        unit: 'mg/dL', refMin: 40, refMax: 999, patterns: [/\bH[DO]L\b/i] },
+    'TRG':    { name: '중성지방',             nameEn: 'Triglycerides',          unit: 'mg/dL', refMin: 0,  refMax: 149, patterns: [/\bTR[GC6Q]\b/i] },
+    'LDL':    { name: 'LDL 콜레스테롤',       nameEn: 'LDL Cholesterol (calc)', unit: 'mg/dL', refMin: 0,  refMax: 129,
+      // D→B/O/0, L→I/1, 모든 조합 허용
+      patterns: [/\bLDL\b/i, /\bL[DB0O][LI1]\b/i, /\bLD[I1]\b/i] },
+    'non-HDL':{ name: 'non-HDL 콜레스테롤',  nameEn: 'non-HDL Cholesterol',   unit: 'mg/dL', refMin: 0,  refMax: 159, patterns: [/non.{0,3}H[DO]L/i] },
+    'TC/HDL': { name: 'TC/HDL 비율',          nameEn: 'TC/HDL Ratio',           unit: '',      refMin: 0,  refMax: 4.9, patterns: [/TC.{0,3}H[DO]L/i] },
+    'GLU':    { name: '공복혈당',             nameEn: 'Fasting Glucose',        unit: 'mg/dL', refMin: 70, refMax: 100, patterns: [/\bGL[UO0]\b/i] },
+  };
+
+  // TC/HDL·non-HDL을 TC·HDL보다 먼저 체크해야 부분문자열 충돌 없음
+  const MATCH_ORDER: ItemKey[] = ['TC/HDL', 'non-HDL', 'TC', 'HDL', 'TRG', 'LDL', 'GLU'];
 
   // 날짜 파싱: "DD Mon YYYY" 또는 "YYYY-MM-DD"
   const MONTHS: Record<string, string> = {
@@ -264,51 +278,111 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
 
   const found = new Map<string, number>();
 
-  // ── 1단계: bounding-box 행별 매칭 ──
-  // 각 행에서 키 레이블과 숫자를 함께 찾음 → =부호 오인식에 완전히 독립적
-  const rows = groupRows(words, 18);
+  // ── 1단계: bounding-box 행별 퍼지 매칭 ──
+  const rows = groupRows(words, 30); // 2x 전처리 이미지 기준 30px
   for (const row of rows) {
     const rowText = row.map((w) => w.text).join(' ');
-    const nums = rowText.match(/\d[\d.]*/g);
-    if (!nums) continue;
+    // 소수(TC/HDL용) 우선, 없으면 2-3자리 정수
+    const decNum = rowText.match(/\b(\d{1,3}\.\d+)\b/);
+    const intNums = (rowText.match(/\b\d{2,3}\b/g) ?? []).filter(n => {
+      const v = parseInt(n); return v > 0 && v < 2000;
+    });
+    const rowValue = decNum ? parseFloat(decNum[1]) : (intNums.length ? parseFloat(intNums[0]) : NaN);
+    if (isNaN(rowValue)) continue;
 
-    for (const item of ITEMS) {
-      if (found.has(item.key)) continue;
-      if (!item.re.test(rowText)) continue;
-      const value = parseFloat(nums[0]);
-      if (!isNaN(value)) found.set(item.key, value);
-      break; // 이 행은 이 항목이 처리 — 다음 행으로
+    for (const key of MATCH_ORDER) {
+      if (found.has(key)) continue;
+      if (META[key].patterns.some(p => p.test(rowText))) {
+        found.set(key, rowValue);
+        break;
+      }
     }
   }
 
-  // ── 2단계: text regex 보완 (행 그룹화로 못 잡은 항목) ──
-  for (const item of ITEMS) {
-    if (found.has(item.key)) continue;
-    const keyPat = item.key.replace(/[/\-.]/g, (c) => `\\${c}`);
-    const re1 = new RegExp(`^\\s*${keyPat}[^a-zA-Z\\d\\n\\r]{0,4}(\\d[\\d.]*)`, 'im');
-    const re2 = new RegExp(`(?:^|[^a-zA-Z])${keyPat}[^a-zA-Z\\d]{0,4}(\\d[\\d.]*)`, 'i');
-    const m = text.match(re1) ?? text.match(re2);
-    if (m) found.set(item.key, parseFloat(m[1]));
-    else console.debug(`[OCR-B miss] ${item.key}`);
+  // ── 2단계: 전체 텍스트 regex 보완 ──
+  for (const key of MATCH_ORDER) {
+    if (found.has(key)) continue;
+    for (const pat of META[key].patterns) {
+      const re = new RegExp(`(?:${pat.source})[^a-zA-Z\\d]{0,4}(\\d[\\d.]*)`, 'i');
+      const m = text.match(re);
+      if (m) { found.set(key, parseFloat(m[1])); break; }
+    }
+    if (!found.has(key)) console.debug(`[OCR-B miss after stage2] ${key}`);
   }
 
-  // ── 결과 조립 ──
+  // ── 3단계: 순수 위치 기반 추출 (키 레이블 인식 완전 실패 대비) ──
+  // Cholestech는 TC,HDL,TRG,LDL,non-HDL,TC/HDL,GLU 순서가 고정됨
+  // → "Name/ID" 구분선 이하, 왼쪽 60% 영역의 숫자를 Y 순서대로 7개 키에 매핑
+  if (found.size < KEY_ORDER.length) {
+    // 구분선 Y 위치 추정: "Name", "ID", "------" 키워드 또는 기인식 항목 최소 Y
+    let valAreaTopY = 0;
+    for (const w of words) {
+      const t = w.text.trim().toLowerCase();
+      if (t === 'name' || t === 'id' || /^[-─_]{3,}$/.test(t)) {
+        valAreaTopY = Math.max(valAreaTopY, w.bbox.y1);
+      }
+    }
+    // 기인식 항목이 있으면 그 중 최소 Y를 기준으로 보정
+    for (const row of rows) {
+      const rowText = row.map(w => w.text).join(' ');
+      for (const key of MATCH_ORDER) {
+        if (!found.has(key)) continue;
+        if (META[key].patterns.some(p => p.test(rowText))) {
+          const rowTop = Math.min(...row.map(w => w.bbox.y0));
+          if (rowTop > valAreaTopY) valAreaTopY = rowTop - 2; // 첫 값 행 직전
+        }
+      }
+    }
+    // 아직도 0이면 전체 Y 범위의 상위 25% 컷
+    if (valAreaTopY === 0) {
+      const ys = words.map(w => w.bbox.y0);
+      valAreaTopY = Math.min(...ys) + (Math.max(...ys) - Math.min(...ys)) * 0.25;
+    }
+
+    const maxX = Math.max(...words.map(w => w.bbox.x1), 1);
+
+    // 값 영역 숫자 수집 (오른쪽 mg/dL 컬럼 제외, 연도 제외)
+    const candidateNums = words
+      .filter(w => {
+        const t = w.text.trim();
+        if (!/^\d[\d.]*$/.test(t)) return false;
+        const v = parseFloat(t);
+        return v > 0
+          && !(v >= 2020 && v <= 2030)   // 연도 제외
+          && w.bbox.y0 >= valAreaTopY
+          && w.bbox.x1 < maxX * 0.60;   // mg/dL 컬럼 제외
+      })
+      .sort((a, b) => a.bbox.y0 - b.bbox.y0);
+
+    console.debug('[OCR-B pos-candidates]', candidateNums.map(w => `${w.text}@y${w.bbox.y0}`));
+
+    // KEY_ORDER 인덱스(0~6)로 Y-정렬된 숫자에 직접 매핑
+    KEY_ORDER.forEach((key, idx) => {
+      if (found.has(key)) return;
+      const cand = candidateNums[idx];
+      if (cand) {
+        found.set(key, parseFloat(cand.text));
+        console.debug(`[OCR-B pos] ${key}[${idx}] = ${cand.text}`);
+      }
+    });
+  }
+
+  console.debug('[OCR-B result]', Object.fromEntries(found));
+
+  // ── 결과 조립 (KEY_ORDER 순서 유지) ──
   const items: OcrResult['items'] = [];
-  for (const item of ITEMS) {
-    const value = found.get(item.key);
+  for (const key of KEY_ORDER) {
+    const value = found.get(key);
     if (value === undefined) continue;
-    const { refMin, refMax } = item;
+    const { name, nameEn, unit, refMin, refMax } = META[key];
     const itemStatus = (value >= refMin && value <= refMax) ? 'normal' as const : 'caution' as const;
     items.push({
-      name: item.name,
-      name_en: item.nameEn,
-      value,
-      display_value: null,
-      unit: item.unit,
+      name, name_en: nameEn, value,
+      display_value: null, unit,
       ref_min: refMin,
       ref_max: refMax >= 900 ? null : refMax,
       status: itemStatus,
-      confidence: 0.82,
+      confidence: found.size >= 7 ? 0.88 : 0.72,
     });
   }
 
