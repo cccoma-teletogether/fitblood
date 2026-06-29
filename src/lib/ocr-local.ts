@@ -240,6 +240,13 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
 
   console.debug('[OCR-B raw]', text);
 
+  // 숫자 직후 문자-숫자 혼동 보정: "3h)" → "38)", "=3I" → "=31"
+  // 열화인쇄에서 8↔h, 0↔o, 1↔i/l/I/L 혼동이 빈번함
+  const fixedText = text.replace(
+    /(?<=\d)([hoiIlLHO])(?=[\d\s.,):/\-\n]|$)/g,
+    (c) => ({ h:'8',H:'8',o:'0',O:'0',i:'1',I:'1',l:'1',L:'1' }[c] ?? c)
+  );
+
   // Cholestech는 항상 이 순서로 7개 항목 출력
   const KEY_ORDER = ['TC', 'HDL', 'TRG', 'LDL', 'non-HDL', 'TC/HDL', 'GLU'] as const;
   type ItemKey = typeof KEY_ORDER[number];
@@ -303,70 +310,50 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
     }
   }
 
-  // ── 2단계: 전체 텍스트 regex 보완 ──
+  // ── 2단계: 전체 텍스트 regex 보완 (fixedText 사용: h→8 등 교정 적용) ──
   for (const key of MATCH_ORDER) {
     if (found.has(key)) continue;
     for (const pat of META[key].patterns) {
-      const re = new RegExp(`(?:${pat.source})[^a-zA-Z\\d]{0,4}(\\d[\\d.]*)`, 'i');
-      const m = text.match(re);
+      // 2자리 이상 정수 또는 소수만 허용 (단일 자리 오인식 방지)
+      const re = new RegExp(`(?:${pat.source})[^a-zA-Z\\d]{0,4}(\\d{2,}[\\d.]*|\\d+\\.\\d+)`, 'i');
+      const m = fixedText.match(re);
       if (m) { found.set(key, parseFloat(m[1])); break; }
     }
     if (!found.has(key)) console.debug(`[OCR-B miss after stage2] ${key}`);
   }
 
-  // ── 3단계: 행 기반 위치 추출 (키 레이블 인식 완전 실패 대비) ──
-  // Cholestech는 TC,HDL,TRG,LDL,non-HDL,TC/HDL,GLU 순서 고정.
-  // 행 전체 텍스트에서 값을 추출해 Y 순으로 KEY_ORDER에 매핑.
+  // ── 3단계: mg/dL 앵커 텍스트 라인 위치 추출 ──
+  // words는 confidence>20 필터로 실제 값 단어들이 제거되는 문제가 있음.
+  // 대신 fixedText 라인 중 mg/dL 를 포함한 라인만 추출: Cholestech 7개 항목 모두 mg/dL을 가짐.
   if (found.size < KEY_ORDER.length) {
-    let valAreaTopY = 0;
-    for (const w of words) {
-      const t = w.text.trim().toLowerCase();
-      if (t.startsWith('name') || t === 'id' || t.startsWith('sample') || /^[-─_]{3,}$/.test(t)) {
-        valAreaTopY = Math.max(valAreaTopY, w.bbox.y1);
-      }
-    }
-    // Name/ID가 없을 때만: 기인식 항목 중 가장 위(Y 최솟값) 행을 separator로 사용
-    // ※ 최대 Y를 쓰면 found 항목 아래만 탐색하는 치명적 오류 발생
-    if (valAreaTopY === 0) {
-      let minFoundY = Infinity;
-      for (const row of rows) {
-        const rowText = row.map(w => w.text).join(' ');
-        for (const key of MATCH_ORDER) {
-          if (!found.has(key)) continue;
-          if (META[key].patterns.some(p => p.test(rowText))) {
-            const rowTop = Math.min(...row.map(w => w.bbox.y0));
-            minFoundY = Math.min(minFoundY, rowTop);
-          }
-        }
-      }
-      if (minFoundY !== Infinity) valAreaTopY = Math.max(0, minFoundY - 2);
-    }
-    if (valAreaTopY === 0) {
-      const ys = words.map(w => w.bbox.y0);
-      valAreaTopY = Math.min(...ys) + (Math.max(...ys) - Math.min(...ys)) * 0.25;
-    }
-
-    // 행 텍스트에서 숫자값 추출 (KEY=VALUE, split숫자, 소수 모두 처리)
-    function extractRowValue(rowText: string): number | null {
+    function extractLineValue(line: string): number | null {
       // 소수 (TC/HDL 비율)
-      const decMatch = rowText.match(/\b(\d{1,3}\.\d+)\b/);
+      const decMatch = line.match(/\b(\d{1,3}\.\d+)\b/);
       if (decMatch) return parseFloat(decMatch[1]);
-      // KEY=VALUE: TC=230: HDL=38) 등 뒤에 비숫자 허용
-      const eqMatch = rowText.match(/=(\d+)/);
+      // KEY=VALUE 형식
+      const eqMatch = line.match(/=(\d+)/);
       if (eqMatch) {
         const v = parseFloat(eqMatch[1]);
         if (v > 0 && !(v >= 2020 && v <= 2030)) return v;
       }
       // 연도 제외 숫자 수집
-      const nums = (rowText.match(/\d+/g) ?? []).filter(n => {
+      const nums = (line.match(/\d+/g) ?? []).filter(n => {
         const v = parseInt(n);
         return v > 0 && !(v >= 2020 && v <= 2030);
       });
       if (!nums.length) return null;
-      // 2-3자리 직접 우선
+      // 2-3자리 직접 우선 (단 값 < 30이면 split 숫자 결합 시도)
       const good = nums.find(n => n.length >= 2 && n.length <= 3 && parseInt(n) >= 20);
-      if (good) return parseFloat(good);
-      // split 숫자 결합: "21 3%" → "213"
+      if (good) {
+        const v = parseFloat(good);
+        // "20 2" → "202" 같은 split 숫자 결합
+        if (v < 30 && nums.length >= 2) {
+          const concat = nums.slice(0, 2).join('');
+          if (concat.length === 3) { const cv = parseFloat(concat); if (cv >= 100) return cv; }
+        }
+        return v;
+      }
+      // 마지막 수단: 숫자 결합
       const concat = nums.slice(0, 3).join('');
       if (concat.length >= 2 && concat.length <= 4) {
         const v = parseFloat(concat);
@@ -375,34 +362,37 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
       return null;
     }
 
-    // 구분선 아래 값을 가진 행들을 Y 순으로 수집
-    const dataRows = rows
-      .filter(row => {
-        const rowTop = Math.min(...row.map(w => w.bbox.y0));
-        if (rowTop < valAreaTopY) return false;
-        const rt = row.map(w => w.text).join(' ').trim();
-        return !/^(mg\/?dL[\s]*)+$/i.test(rt);
-      })
-      .map(row => ({
-        y: Math.min(...row.map(w => w.bbox.y0)),
-        text: row.map(w => w.text).join(' '),
-        value: extractRowValue(row.map(w => w.text).join(' ')),
-      }))
-      .filter(r => r.value !== null)
-      .sort((a, b) => a.y - b.y);
+    // fixedText에서 mg/dL 포함 라인 추출 (reading order = top-to-bottom)
+    const mgdlLines = fixedText
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => /mg\s*\/?\s*d[lL]/i.test(l));
 
-    console.debug('[OCR-B pos-candidates]', dataRows.map(r => `${r.value}@y${r.y} "${r.text}"`));
+    console.debug('[OCR-B pos-candidates]', mgdlLines.map((l, i) => {
+      const v = extractLineValue(l);
+      return `[${i}]${v ?? '-'}:"${l}"`;
+    }));
 
-    // KEY_ORDER 순으로 dataRows를 소비: 이미 찾은 키는 row 하나씩 건너뜀
-    let rowIdx = 0;
-    for (let ki = 0; ki < KEY_ORDER.length; ki++) {
-      const key = KEY_ORDER[ki];
-      if (found.has(key)) { rowIdx++; continue; }
-      if (rowIdx < dataRows.length) {
-        found.set(key, dataRows[rowIdx]!.value!);
-        console.debug(`[OCR-B pos] ${key}[${ki}] = ${dataRows[rowIdx]!.value}`);
+    // KEY_ORDER 순서로 mgdlLines를 소비: 이미 찾은 키는 라인 하나 건너뜀
+    KEY_ORDER.forEach((key, ki) => {
+      if (found.has(key)) return;
+      const line = mgdlLines[ki];
+      if (!line) return;
+      const value = extractLineValue(line);
+      if (value !== null) {
+        found.set(key, value);
+        console.debug(`[OCR-B pos] ${key}[${ki}] = ${value}`);
       }
-      rowIdx++;
+    });
+
+    // TC/HDL 정합성: 비율값(0.5~12)이 아닌 정수(>12)이면 GLU 행이 올라온 것 → GLU 재배정
+    if (found.has('TC/HDL') && !found.has('GLU')) {
+      const v = found.get('TC/HDL')!;
+      if (v > 12 && Number.isInteger(v)) {
+        found.set('GLU', v);
+        found.delete('TC/HDL');
+        console.debug('[OCR-B sanity] TC/HDL reassigned to GLU:', v);
+      }
     }
   }
 
