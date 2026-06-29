@@ -11,9 +11,10 @@ type TWord = {
   confidence: number;
 };
 
-/* ─── 이미지 전처리: 3배 확대 + 적응형 이진화 ─── */
-// brightness를 올리면 열화인쇄의 연한 텍스트(하단 행)가 흰색으로 날아감.
-// 대신 로컬 밴드 평균을 기준으로 적응형 임계값을 적용해 연한 텍스트도 보존한다.
+/* ─── 이미지 전처리: 3배 확대 + 연한 텍스트 보존 이진화 ─── */
+// brightness(70%): 모든 픽셀을 어둡게 → 연한 텍스트(값 ~200)가 중간값(127) 이하로 내려옴
+// contrast(300%): 중간값 미만(텍스트)→검정, 초과(배경)→흰색으로 확대
+// 적응형 밴드 방식은 노이즈가 없는 이미지에서 잘못된 암점을 만들 수 있어 CSS 필터만 사용
 async function preprocessForOcr(dataUrl: string): Promise<string> {
   if (typeof document === 'undefined') return dataUrl;
   return new Promise((resolve) => {
@@ -23,34 +24,8 @@ async function preprocessForOcr(dataUrl: string): Promise<string> {
       canvas.width = img.width * 3;
       canvas.height = img.height * 3;
       const ctx = canvas.getContext('2d')!;
-      // brightness 올리지 않음 — 연한 인쇄 보존
-      ctx.filter = 'grayscale(100%) contrast(180%)';
+      ctx.filter = 'grayscale(100%) brightness(70%) contrast(300%)';
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-      // 적응형 이진화: 20개 수평 밴드 각각 로컬 평균으로 임계값 결정
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const { data } = imageData;
-      const W = canvas.width;
-      const H = canvas.height;
-      const BAND = Math.ceil(H / 20);
-
-      for (let bandY = 0; bandY < H; bandY += BAND) {
-        const endY = Math.min(bandY + BAND, H);
-        let sum = 0, count = 0;
-        for (let y = bandY; y < endY; y++) {
-          for (let x = 0; x < W; x++) { sum += data[(y * W + x) * 4]; count++; }
-        }
-        const localAvg = count > 0 ? sum / count : 200;
-        // 밝은 밴드(연한 인쇄)일수록 임계값을 더 낮춰 희미한 텍스트도 검은색으로 처리
-        const thresh = localAvg > 220 ? localAvg * 0.75 : localAvg * 0.85;
-        for (let y = bandY; y < endY; y++) {
-          for (let x = 0; x < W; x++) {
-            const i = (y * W + x) * 4;
-            data[i] = data[i + 1] = data[i + 2] = data[i] < thresh ? 0 : 255;
-          }
-        }
-      }
-      ctx.putImageData(imageData, 0, 0);
       resolve(canvas.toDataURL('image/png'));
     };
     img.src = dataUrl;
@@ -275,7 +250,8 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
     patterns: RegExp[];
   }> = {
     'TC':     { name: '총콜레스테롤',         nameEn: 'Total Cholesterol',      unit: 'mg/dL', refMin: 0,  refMax: 199, patterns: [/\bTC\b/i] },
-    'HDL':    { name: 'HDL 콜레스테롤',       nameEn: 'HDL Cholesterol',        unit: 'mg/dL', refMin: 40, refMax: 999, patterns: [/\bH[DO]L\b/i] },
+    // (?<![a-zA-Z-]): "non-HDL"의 "-HDL" 부분이 잘못 매칭되지 않도록 앞에 문자/하이픈이 없어야 함
+    'HDL':    { name: 'HDL 콜레스테롤',       nameEn: 'HDL Cholesterol',        unit: 'mg/dL', refMin: 40, refMax: 999, patterns: [/(?<![a-zA-Z-])H[DO]L\b/i] },
     'TRG':    { name: '중성지방',             nameEn: 'Triglycerides',          unit: 'mg/dL', refMin: 0,  refMax: 149, patterns: [/\bTR[GC6Q]\b/i] },
     'LDL':    { name: 'LDL 콜레스테롤',       nameEn: 'LDL Cholesterol (calc)', unit: 'mg/dL', refMin: 0,  refMax: 129,
       // D→B/O/0, L→I/1, 모든 조합 허용
@@ -349,15 +325,21 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
         valAreaTopY = Math.max(valAreaTopY, w.bbox.y1);
       }
     }
-    for (const row of rows) {
-      const rowText = row.map(w => w.text).join(' ');
-      for (const key of MATCH_ORDER) {
-        if (!found.has(key)) continue;
-        if (META[key].patterns.some(p => p.test(rowText))) {
-          const rowTop = Math.min(...row.map(w => w.bbox.y0));
-          if (rowTop > valAreaTopY) valAreaTopY = rowTop - 2;
+    // Name/ID가 없을 때만: 기인식 항목 중 가장 위(Y 최솟값) 행을 separator로 사용
+    // ※ 최대 Y를 쓰면 found 항목 아래만 탐색하는 치명적 오류 발생
+    if (valAreaTopY === 0) {
+      let minFoundY = Infinity;
+      for (const row of rows) {
+        const rowText = row.map(w => w.text).join(' ');
+        for (const key of MATCH_ORDER) {
+          if (!found.has(key)) continue;
+          if (META[key].patterns.some(p => p.test(rowText))) {
+            const rowTop = Math.min(...row.map(w => w.bbox.y0));
+            minFoundY = Math.min(minFoundY, rowTop);
+          }
         }
       }
+      if (minFoundY !== Infinity) valAreaTopY = Math.max(0, minFoundY - 2);
     }
     if (valAreaTopY === 0) {
       const ys = words.map(w => w.bbox.y0);
