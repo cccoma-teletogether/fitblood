@@ -11,20 +11,26 @@ type TWord = {
   confidence: number;
 };
 
-/* ─── 이미지 전처리: 3배 확대 + 연한 텍스트 보존 이진화 ─── */
-// brightness(70%): 모든 픽셀을 어둡게 → 연한 텍스트(값 ~200)가 중간값(127) 이하로 내려옴
-// contrast(300%): 중간값 미만(텍스트)→검정, 초과(배경)→흰색으로 확대
-// 적응형 밴드 방식은 노이즈가 없는 이미지에서 잘못된 암점을 만들 수 있어 CSS 필터만 사용
-async function preprocessForOcr(dataUrl: string): Promise<string> {
+/* ─── 이미지 전처리: 여러 노출 변형(variant)으로 생성 ─── */
+// 이미지마다 인쇄 농도·노출이 달라 단일 필터로는 한계.
+// 서로 다른 brightness/contrast 조합을 만들어 OCR 점수가 가장 높은 것을 채택.
+const PREPROCESS_VARIANTS: { filter: string; scale: number }[] = [
+  { filter: 'grayscale(100%) brightness(70%) contrast(300%)', scale: 3 },  // 진한 이진화 (연한 인쇄)
+  { filter: 'grayscale(100%) contrast(200%)',                  scale: 3 },  // 중립 (보통 인쇄)
+  { filter: 'grayscale(100%) brightness(125%) contrast(260%)', scale: 2 },  // 밝게 (진한/어두운 사진)
+];
+
+async function preprocessForOcr(dataUrl: string, variant = 0): Promise<string> {
   if (typeof document === 'undefined') return dataUrl;
+  const cfg = PREPROCESS_VARIANTS[variant] ?? PREPROCESS_VARIANTS[0];
   return new Promise((resolve) => {
     const img = new window.Image();
     img.onload = () => {
       const canvas = document.createElement('canvas');
-      canvas.width = img.width * 3;
-      canvas.height = img.height * 3;
+      canvas.width = img.width * cfg.scale;
+      canvas.height = img.height * cfg.scale;
       const ctx = canvas.getContext('2d')!;
-      ctx.filter = 'grayscale(100%) brightness(70%) contrast(300%)';
+      ctx.filter = cfg.filter;
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       resolve(canvas.toDataURL('image/png'));
     };
@@ -32,10 +38,24 @@ async function preprocessForOcr(dataUrl: string): Promise<string> {
   });
 }
 
+/* OCR 원문 품질 점수: mg/dL 라인 중 숫자를 포함한 행 수 + 라벨 매칭 수 */
+function scoreOcrText(text: string): number {
+  const lines = text.split('\n');
+  let numberedMgdl = 0;
+  for (const l of lines) {
+    if (/mg\s*\/?\s*d[lL]/i.test(l) && /\d{2,3}/.test(l)) numberedMgdl++;
+  }
+  const labels = (text.match(/\b(TC|HDL|TRG|LDL|GLU)\b/gi) ?? []).length;
+  return numberedMgdl * 2 + labels;
+}
+
 /* ─── Tesseract 실행 ─── */
-async function recognize(imageDataUrl: string): Promise<{ words: TWord[]; text: string }> {
+async function recognize(
+  imageDataUrl: string,
+  langs: string[] = ['kor', 'eng'],
+): Promise<{ words: TWord[]; text: string }> {
   const { createWorker } = await import('tesseract.js');
-  const worker = await createWorker(['kor', 'eng'], 1);
+  const worker = await createWorker(langs, 1);
   const result = await worker.recognize(imageDataUrl);
   await worker.terminate();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -235,8 +255,18 @@ async function parseClinic(imageDataUrl: string): Promise<OcrResult> {
    3) 순수 위치 기반 (키 레이블 인식 실패 대비)
 ───────────────────────────────────────── */
 async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
-  const processed = await preprocessForOcr(imageDataUrl);
-  const { words, text } = await recognize(processed);
+  // Cholestech 영수증은 전부 영문/숫자 → 'eng' 전용이 빠르고 정확 (kor는 한글 환각 유발)
+  // 첫 변형으로 시도, 점수가 낮으면 다른 노출 변형으로 재시도해 최선 채택
+  let best = { text: '', words: [] as TWord[], score: -1 };
+  for (let v = 0; v < PREPROCESS_VARIANTS.length; v++) {
+    const processed = await preprocessForOcr(imageDataUrl, v);
+    const r = await recognize(processed, ['eng']);
+    const sc = scoreOcrText(r.text);
+    console.debug(`[OCR-B variant ${v}] score=${sc}`);
+    if (sc > best.score) best = { ...r, score: sc };
+    if (sc >= 8) break; // 충분히 좋으면 조기 종료 (4행 이상 숫자 인식)
+  }
+  const { words, text } = best;
 
   console.debug('[OCR-B raw]', text);
 
@@ -396,15 +426,35 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
     }
   }
 
-  // ── 4단계: TC/HDL·non-HDL 수식 유도 (OCR 실패 최후 보완) ──
-  if (!found.has('non-HDL') && found.has('TC') && found.has('HDL')) {
-    found.set('non-HDL', found.get('TC')! - found.get('HDL')!);
-    console.debug('[OCR-B derived] non-HDL =', found.get('non-HDL'));
+  // ── 4단계: 계산 필드를 측정값에서 수식으로 도출 (OCR보다 정확) ──
+  // Cholestech는 non-HDL/LDL/TC/HDL을 기기 내부에서 계산해 출력하므로,
+  // TC·HDL·TRG를 신뢰성 있게 읽었다면 OCR값보다 수식값이 정확하다.
+  // → 측정값(TC,HDL,TRG)이 있으면 계산 필드는 수식으로 덮어쓴다.
+  const tc = found.get('TC'), hdl = found.get('HDL'), trg = found.get('TRG');
+
+  if (tc != null && hdl != null) {
+    const nonHdl = tc - hdl;
+    if (nonHdl > 0) {
+      const prev = found.get('non-HDL');
+      found.set('non-HDL', nonHdl);
+      if (prev !== nonHdl) console.debug(`[OCR-B calc] non-HDL = ${nonHdl} (OCR was ${prev ?? '-'})`);
+    }
+    if (hdl > 0) {
+      const ratio = Math.round((tc / hdl) * 10) / 10;
+      const prev = found.get('TC/HDL');
+      found.set('TC/HDL', ratio);
+      if (prev !== ratio) console.debug(`[OCR-B calc] TC/HDL = ${ratio} (OCR was ${prev ?? '-'})`);
+    }
   }
-  if (!found.has('TC/HDL') && found.has('TC') && found.has('HDL') && found.get('HDL')! > 0) {
-    const ratio = Math.round(found.get('TC')! / found.get('HDL')! * 10) / 10;
-    found.set('TC/HDL', ratio);
-    console.debug('[OCR-B derived] TC/HDL =', ratio);
+
+  // LDL: Friedewald 식 (TRG < 400일 때 유효) — 기기와 동일 계산
+  if (tc != null && hdl != null && trg != null && trg < 400) {
+    const ldl = Math.round(tc - hdl - trg / 5);
+    if (ldl > 0) {
+      const prev = found.get('LDL');
+      found.set('LDL', ldl);
+      if (prev !== ldl) console.debug(`[OCR-B calc] LDL = ${ldl} Friedewald (OCR was ${prev ?? '-'})`);
+    }
   }
 
   console.debug('[OCR-B result]', Object.fromEntries(found));
