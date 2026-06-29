@@ -11,18 +11,46 @@ type TWord = {
   confidence: number;
 };
 
-/* ─── 이미지 전처리: 2배 확대 + 고대비 흑백 ─── */
+/* ─── 이미지 전처리: 3배 확대 + 적응형 이진화 ─── */
+// brightness를 올리면 열화인쇄의 연한 텍스트(하단 행)가 흰색으로 날아감.
+// 대신 로컬 밴드 평균을 기준으로 적응형 임계값을 적용해 연한 텍스트도 보존한다.
 async function preprocessForOcr(dataUrl: string): Promise<string> {
   if (typeof document === 'undefined') return dataUrl;
   return new Promise((resolve) => {
     const img = new window.Image();
     img.onload = () => {
       const canvas = document.createElement('canvas');
-      canvas.width = img.width * 2;
-      canvas.height = img.height * 2;
+      canvas.width = img.width * 3;
+      canvas.height = img.height * 3;
       const ctx = canvas.getContext('2d')!;
-      ctx.filter = 'grayscale(100%) contrast(220%) brightness(110%)';
+      // brightness 올리지 않음 — 연한 인쇄 보존
+      ctx.filter = 'grayscale(100%) contrast(180%)';
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+      // 적응형 이진화: 20개 수평 밴드 각각 로컬 평균으로 임계값 결정
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const { data } = imageData;
+      const W = canvas.width;
+      const H = canvas.height;
+      const BAND = Math.ceil(H / 20);
+
+      for (let bandY = 0; bandY < H; bandY += BAND) {
+        const endY = Math.min(bandY + BAND, H);
+        let sum = 0, count = 0;
+        for (let y = bandY; y < endY; y++) {
+          for (let x = 0; x < W; x++) { sum += data[(y * W + x) * 4]; count++; }
+        }
+        const localAvg = count > 0 ? sum / count : 200;
+        // 밝은 밴드(연한 인쇄)일수록 임계값을 더 낮춰 희미한 텍스트도 검은색으로 처리
+        const thresh = localAvg > 220 ? localAvg * 0.75 : localAvg * 0.85;
+        for (let y = bandY; y < endY; y++) {
+          for (let x = 0; x < W; x++) {
+            const i = (y * W + x) * 4;
+            data[i] = data[i + 1] = data[i + 2] = data[i] < thresh ? 0 : 255;
+          }
+        }
+      }
+      ctx.putImageData(imageData, 0, 0);
       resolve(canvas.toDataURL('image/png'));
     };
     img.src = dataUrl;
@@ -318,7 +346,8 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
     let valAreaTopY = 0;
     for (const w of words) {
       const t = w.text.trim().toLowerCase();
-      if (t === 'name' || t === 'id' || /^[-─_]{3,}$/.test(t)) {
+      // "Name/" 또는 "Name" 등 다양한 형태 허용
+      if (t.startsWith('name') || t === 'id' || t === 'sample' || /^[-─_]{3,}$/.test(t)) {
         valAreaTopY = Math.max(valAreaTopY, w.bbox.y1);
       }
     }
@@ -342,17 +371,25 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
     const maxX = Math.max(...words.map(w => w.bbox.x1), 1);
 
     // 값 영역 숫자 수집 (오른쪽 mg/dL 컬럼 제외, 연도 제외)
-    const candidateNums = words
-      .filter(w => {
-        const t = w.text.trim();
-        if (!/^\d[\d.]*$/.test(t)) return false;
+    // "TC=143" 형태도 처리: =뒤 숫자를 가상 단어로 추가
+    const expandedWords: (TWord & { numVal: number })[] = [];
+    for (const w of words) {
+      if (w.bbox.y0 < valAreaTopY || w.bbox.x1 >= maxX * 0.65) continue;
+      const t = w.text.trim();
+      // 순수 숫자
+      if (/^\d[\d.]*$/.test(t)) {
         const v = parseFloat(t);
-        return v > 0
-          && !(v >= 2020 && v <= 2030)   // 연도 제외
-          && w.bbox.y0 >= valAreaTopY
-          && w.bbox.x1 < maxX * 0.60;   // mg/dL 컬럼 제외
-      })
-      .sort((a, b) => a.bbox.y0 - b.bbox.y0);
+        if (v > 0 && !(v >= 2020 && v <= 2030)) expandedWords.push({ ...w, numVal: v });
+        continue;
+      }
+      // KEY=VALUE 또는 KEY=VALUE 패턴에서 숫자 추출
+      const eqMatch = t.match(/=(\d+(?:\.\d+)?)$/);
+      if (eqMatch) {
+        const v = parseFloat(eqMatch[1]);
+        if (v > 0 && !(v >= 2020 && v <= 2030)) expandedWords.push({ ...w, numVal: v });
+      }
+    }
+    const candidateNums = expandedWords.sort((a, b) => a.bbox.y0 - b.bbox.y0);
 
     console.debug('[OCR-B pos-candidates]', candidateNums.map(w => `${w.text}@y${w.bbox.y0}`));
 
@@ -361,8 +398,8 @@ async function parseHealthcenter(imageDataUrl: string): Promise<OcrResult> {
       if (found.has(key)) return;
       const cand = candidateNums[idx];
       if (cand) {
-        found.set(key, parseFloat(cand.text));
-        console.debug(`[OCR-B pos] ${key}[${idx}] = ${cand.text}`);
+        found.set(key, cand.numVal);
+        console.debug(`[OCR-B pos] ${key}[${idx}] = ${cand.numVal} (from "${cand.text}")`);
       }
     });
   }
